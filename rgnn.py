@@ -58,14 +58,119 @@ def save_col_slice(x_src, x_dst, start_row_idx, end_row_idx, start_col_idx,
         x_dst[offset + i:offset + j, start_col_idx:end_col_idx] = x_src[i:j]
 
 
+class RGNN(LightningModule):
+    def __init__(self, model: str, in_channels: int, out_channels: int,
+                 hidden_channels: int, num_relations: int, num_layers: int,
+                 heads: int = 4, dropout: float = 0.5):
+        super().__init__()
+        self.save_hyperparameters()
+        self.model = model.lower()
+        self.num_relations = num_relations
+        self.dropout = dropout
+
+        self.convs = ModuleList()
+        self.norms = ModuleList()
+        self.skips = ModuleList()
+
+        if self.model == 'rgat':
+            self.convs.append(
+                ModuleList([
+                    GATConv(in_channels, hidden_channels // heads, heads,
+                            add_self_loops=False) for _ in range(num_relations)
+                ]))
+
+            for _ in range(num_layers - 1):
+                self.convs.append(
+                    ModuleList([
+                        GATConv(hidden_channels, hidden_channels // heads,
+                                heads, add_self_loops=False)
+                        for _ in range(num_relations)
+                    ]))
+
+        elif self.model == 'rgraphsage':
+            self.convs.append(
+                ModuleList([
+                    SAGEConv(in_channels, hidden_channels, root_weight=False)
+                    for _ in range(num_relations)
+                ]))
+
+            for _ in range(num_layers - 1):
+                self.convs.append(
+                    ModuleList([
+                        SAGEConv(hidden_channels, hidden_channels,
+                                 root_weight=False)
+                        for _ in range(num_relations)
+                    ]))
+
+        for _ in range(num_layers):
+            self.norms.append(BatchNorm1d(hidden_channels))
+
+        self.skips.append(Linear(in_channels, hidden_channels))
+        for _ in range(num_layers - 1):
+            self.skips.append(Linear(hidden_channels, hidden_channels))
+
+        self.mlp = Sequential(
+            Linear(hidden_channels, hidden_channels),
+            BatchNorm1d(hidden_channels),
+            ReLU(inplace=True),
+            Dropout(p=self.dropout),
+            Linear(hidden_channels, out_channels),
+        )
+
+        self.train_acc = Accuracy()
+        self.val_acc = Accuracy()
+        self.test_acc = Accuracy()
+
+    def forward(self, x: Tensor, adjs_t: List[SparseTensor]) -> Tensor:
+        for i, adj_t in enumerate(adjs_t):
+            x_target = x[:adj_t.size(0)]
+
+            out = self.skips[i](x_target)
+            for j in range(self.num_relations):
+                edge_type = adj_t.storage.value() == j
+                subadj_t = adj_t.masked_select_nnz(edge_type, layout='coo')
+                subadj_t = subadj_t.set_value(None, layout=None)
+                if subadj_t.nnz() > 0:
+                    out += self.convs[i][j]((x, x_target), subadj_t)
+
+            x = self.norms[i](out)
+            x = F.relu(x) if self.model == 'rgat' else F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+
+        return self.mlp(x)
+
+    def training_step(self, batch, batch_idx: int):
+        y_hat = self(batch.x, batch.adjs_t)
+        train_loss = F.cross_entropy(y_hat, batch.y)
+        self.train_acc(y_hat.softmax(dim=-1), batch.y)
+        self.log('train_acc', self.train_acc, prog_bar=True, on_step=False,
+                 on_epoch=True)
+        return train_loss
+
+    def validation_step(self, batch, batch_idx: int):
+        y_hat = self(batch.x, batch.adjs_t)
+        self.val_acc(y_hat.softmax(dim=-1), batch.y)
+        self.log('val_acc', self.val_acc, on_step=False, on_epoch=True,
+                 prog_bar=True, sync_dist=True)
+
+    def test_step(self, batch, batch_idx: int):
+        y_hat = self(batch.x, batch.adjs_t)
+        self.test_acc(y_hat.softmax(dim=-1), batch.y)
+        self.log('test_acc', self.test_acc, on_step=False, on_epoch=True,
+                 prog_bar=True, sync_dist=True)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        scheduler = StepLR(optimizer, step_size=25, gamma=0.25)
+        return [optimizer], [scheduler]
+
+
 class MAG240M(LightningDataModule):
-    def __init__(self, data_dir: str, batch_size: int, sizes: List[int],
-                 in_memory: bool = False):
+    def __init__(self, data_dir: str, batch_size: int, sizes: List[int]):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.sizes = sizes
-        self.in_memory = in_memory
 
     @property
     def num_features(self) -> int:
@@ -232,20 +337,9 @@ class MAG240M(LightningDataModule):
         self.test_idx = torch.from_numpy(dataset.get_idx_split('test-dev'))
         self.test_idx.share_memory_()
 
-        N = dataset.num_papers + dataset.num_authors + dataset.num_institutions
+        self.x = np.load(f'{dataset.dir}/full_feat.npy')
+        self.x = torch.from_numpy(self.x).share_memory_()
 
-        # x = np.memmap(f'{dataset.dir}/full_feat.npy', dtype=np.float16,
-        #                    mode='r', shape=(N, self.num_features))
-        if self.in_memory:
-            # print(f"Loading feature from: {dataset.dir}/full_feat.npy")
-            # self.x = np.empty((N, self.num_features), dtype=np.float16)
-            # self.x[:] = self.x
-            # print(f"Convert to torch.float")
-            self.x = np.load(f'{dataset.dir}/full_feat.npy')
-            self.x = torch.from_numpy(self.x).share_memory_()
-        else:
-            # self.x = x
-            self.x = np.load(f'{dataset.dir}/full_feat.npy')
 
         self.y = torch.from_numpy(dataset.all_paper_label)
 
@@ -279,119 +373,9 @@ class MAG240M(LightningDataModule):
                                batch_size=self.batch_size, num_workers=4)
 
     def convert_batch(self, batch_size, n_id, adjs):
-        if self.in_memory:
-            x = self.x[n_id].to(torch.float)
-        else:
-            x = torch.from_numpy(self.x[n_id.numpy()]).to(torch.float)
+        x = self.x[n_id].to(torch.float)
         y = self.y[n_id[:batch_size]].to(torch.long)
         return Batch(x=x, y=y, adjs_t=[adj_t for adj_t, _, _ in adjs])
-
-
-class RGNN(LightningModule):
-    def __init__(self, model: str, in_channels: int, out_channels: int,
-                 hidden_channels: int, num_relations: int, num_layers: int,
-                 heads: int = 4, dropout: float = 0.5):
-        super().__init__()
-        self.save_hyperparameters()
-        self.model = model.lower()
-        self.num_relations = num_relations
-        self.dropout = dropout
-
-        self.convs = ModuleList()
-        self.norms = ModuleList()
-        self.skips = ModuleList()
-
-        if self.model == 'rgat':
-            self.convs.append(
-                ModuleList([
-                    GATConv(in_channels, hidden_channels // heads, heads,
-                            add_self_loops=False) for _ in range(num_relations)
-                ]))
-
-            for _ in range(num_layers - 1):
-                self.convs.append(
-                    ModuleList([
-                        GATConv(hidden_channels, hidden_channels // heads,
-                                heads, add_self_loops=False)
-                        for _ in range(num_relations)
-                    ]))
-
-        elif self.model == 'rgraphsage':
-            self.convs.append(
-                ModuleList([
-                    SAGEConv(in_channels, hidden_channels, root_weight=False)
-                    for _ in range(num_relations)
-                ]))
-
-            for _ in range(num_layers - 1):
-                self.convs.append(
-                    ModuleList([
-                        SAGEConv(hidden_channels, hidden_channels,
-                                 root_weight=False)
-                        for _ in range(num_relations)
-                    ]))
-
-        for _ in range(num_layers):
-            self.norms.append(BatchNorm1d(hidden_channels))
-
-        self.skips.append(Linear(in_channels, hidden_channels))
-        for _ in range(num_layers - 1):
-            self.skips.append(Linear(hidden_channels, hidden_channels))
-
-        self.mlp = Sequential(
-            Linear(hidden_channels, hidden_channels),
-            BatchNorm1d(hidden_channels),
-            ReLU(inplace=True),
-            Dropout(p=self.dropout),
-            Linear(hidden_channels, out_channels),
-        )
-
-        self.train_acc = Accuracy()
-        self.val_acc = Accuracy()
-        self.test_acc = Accuracy()
-
-    def forward(self, x: Tensor, adjs_t: List[SparseTensor]) -> Tensor:
-        for i, adj_t in enumerate(adjs_t):
-            x_target = x[:adj_t.size(0)]
-
-            out = self.skips[i](x_target)
-            for j in range(self.num_relations):
-                edge_type = adj_t.storage.value() == j
-                subadj_t = adj_t.masked_select_nnz(edge_type, layout='coo')
-                subadj_t = subadj_t.set_value(None, layout=None)
-                if subadj_t.nnz() > 0:
-                    out += self.convs[i][j]((x, x_target), subadj_t)
-
-            x = self.norms[i](out)
-            x = F.elu(x) if self.model == 'rgat' else F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-
-        return self.mlp(x)
-
-    def training_step(self, batch, batch_idx: int):
-        y_hat = self(batch.x, batch.adjs_t)
-        train_loss = F.cross_entropy(y_hat, batch.y)
-        self.train_acc(y_hat.softmax(dim=-1), batch.y)
-        self.log('train_acc', self.train_acc, prog_bar=True, on_step=False,
-                 on_epoch=True)
-        return train_loss
-
-    def validation_step(self, batch, batch_idx: int):
-        y_hat = self(batch.x, batch.adjs_t)
-        self.val_acc(y_hat.softmax(dim=-1), batch.y)
-        self.log('val_acc', self.val_acc, on_step=False, on_epoch=True,
-                 prog_bar=True, sync_dist=True)
-
-    def test_step(self, batch, batch_idx: int):
-        y_hat = self(batch.x, batch.adjs_t)
-        self.test_acc(y_hat.softmax(dim=-1), batch.y)
-        self.log('test_acc', self.test_acc, on_step=False, on_epoch=True,
-                 prog_bar=True, sync_dist=True)
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
-        scheduler = StepLR(optimizer, step_size=25, gamma=0.25)
-        return [optimizer], [scheduler]
 
 
 if __name__ == '__main__':
@@ -403,7 +387,6 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='rgat',
                         choices=['rgat', 'rgraphsage'])
     parser.add_argument('--sizes', type=str, default='25-15')
-    parser.add_argument('--in-memory', action='store_true')
     parser.add_argument('--device', type=str, default='0')
     parser.add_argument('--evaluate', action='store_true')
     args = parser.parse_args()
@@ -411,7 +394,7 @@ if __name__ == '__main__':
     print(args)
 
     seed_everything(42)
-    datamodule = MAG240M(ROOT, args.batch_size, args.sizes, args.in_memory)
+    datamodule = MAG240M(ROOT, args.batch_size, args.sizes)
 
     if not args.evaluate:
         model = RGNN(args.model, datamodule.num_features,

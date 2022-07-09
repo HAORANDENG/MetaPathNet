@@ -1,29 +1,17 @@
-import argparse
-import glob
-import os
 import os.path as osp
 import time
 from typing import Callable, List, NamedTuple, Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from ogb.lsc import MAG240MDataset, MAG240MEvaluator
-from pytorch_lightning import (LightningDataModule, LightningModule, Trainer,
-                               seed_everything)
-from pytorch_lightning.callbacks import ModelCheckpoint
-from torchmetrics import Accuracy
+from ogb.lsc import MAG240MDataset
+from pytorch_lightning import LightningDataModule
 from torch import Tensor
-from torch.nn import BatchNorm1d, Dropout, Linear, ModuleList, ReLU, Sequential
-from torch.optim.lr_scheduler import StepLR
-from torch_geometric.nn import GATConv, SAGEConv
 from torch_sparse import SparseTensor
 from tqdm import tqdm
-
-from root import ROOT
-import torch.multiprocessing
 import path_sampler
 
+import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 
@@ -60,37 +48,21 @@ def save_col_slice(x_src, x_dst, start_row_idx, end_row_idx, start_col_idx,
 
 
 class MetaPathSampler(torch.utils.data.DataLoader):
-    def __init__(self, edge_index, node_idx: Optional[Tensor] = None,
+    def __init__(self, ps, node_idx: Optional[Tensor] = None,
                  num_nodes: Optional[int] = None, transform: Callable = None, **kwargs):
 
-        edge_index = edge_index.to('cpu')
         if 'collate_fn' in kwargs:
             del kwargs['collate_fn']
         if 'dataset' in kwargs:
             del kwargs['dataset']
         # Save for Pytorch Lightning < 1.6:
-        self.edge_index = edge_index
         self.node_idx = node_idx
         self.num_nodes = num_nodes
-
-        self.is_sparse_tensor = isinstance(edge_index, SparseTensor)
         self.__val__ = None
-
-        self.adj_t = edge_index
-        self.adj_t.storage.rowptr()
         self.transform = transform
-
-        if node_idx is None:
-            node_idx = torch.arange(self.adj_t.sparse_size(0))
-        elif node_idx.dtype == torch.bool:
+        if node_idx.dtype == torch.bool:
             node_idx = node_idx.nonzero(as_tuple=False).view(-1)
-
-        row, col, val = self.adj_t.coo()
-        E = torch.stack([row, col, val], dim=0).numpy()
-
-        path_sampler.init()
-        self.ps = path_sampler.MetaPathSampler(E, 1024, 40, 4, 64)
-
+        self.ps = ps
         super().__init__(
             node_idx.view(-1).tolist(), collate_fn=self.sample, **kwargs)
 
@@ -102,7 +74,6 @@ class MetaPathSampler(torch.utils.data.DataLoader):
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(sizes={self.sizes})'
-
 
 
 class MAG240M(LightningDataModule):
@@ -277,203 +248,49 @@ class MAG240M(LightningDataModule):
         self.test_idx = torch.from_numpy(dataset.get_idx_split('test-dev'))
         self.test_idx.share_memory_()
 
-        N = dataset.num_papers + dataset.num_authors + dataset.num_institutions
+        path = f'{dataset.dir}/edge_index.npy'
+        edge_index = np.load(path)
+        path_sampler.init()
+        self.ps = path_sampler.MetaPathSampler(edge_index, 1024, 40, 3, 1)
+        del edge_index
 
-        x = np.memmap(f'{dataset.dir}/full_feat.npy', dtype=np.float16,
-                      mode='r', shape=(N, self.num_features))
 
-        if self.in_memory:
-            print("flag_1")
-            self.x = np.empty((N, self.num_features), dtype=np.float16)
-            print("flag_2")
-            self.x[:] = x
-            print("flag_3")
-            self.x = torch.from_numpy(self.x).share_memory_()
-            print("flag_4")
-        else:
-            self.x = x
+        self.x = np.load(f'{dataset.dir}/full_feat.npy')
+        self.x = torch.from_numpy(self.x).share_memory_()
 
         self.y = torch.from_numpy(dataset.all_paper_label)
-
-        path = f'{dataset.dir}/full_adj_t.pt'
-        self.adj_t = torch.load(path)
         print(f'Done! [{time.perf_counter() - t:.2f}s]')
-        tmp = self.train_dataloader()
 
     def train_dataloader(self):
-        return MetaPathSampler(self.adj_t,  batch_size=self.batch_size,
+        return MetaPathSampler(self.ps,  batch_size=self.batch_size,
                                node_idx=self.train_idx,
                                transform=self.convert_batch,
                                shuffle=True,
-                               num_workers=64)
+                               num_workers=4)
 
     def val_dataloader(self):
-        return MetaPathSampler(self.adj_t, batch_size=self.batch_size,
+        return MetaPathSampler(self.ps, batch_size=self.batch_size,
                                node_idx=self.val_idx,
                                transform=self.convert_batch,
-                               num_workers=32)
+                               num_workers=2)
 
     def test_dataloader(self):  # Test best validation model once again.
-        return MetaPathSampler(self.adj_t, batch_size=self.batch_size,
+        return MetaPathSampler(self.ps, batch_size=self.batch_size,
                                node_idx=self.val_idx,
                                transform=self.convert_batch,
-                               num_workers=32)
+                               num_workers=2)
 
     def hidden_test_dataloader(self):
-        return MetaPathSampler(self.adj_t, batch_size=self.batch_size,
+        return MetaPathSampler(self.ps, batch_size=self.batch_size,
                                node_idx=self.test_idx,
                                transform=self.convert_batch,
-                               num_workers=32)
+                               num_workers=2)
 
     def convert_batch(self, id, ret_a, ret_b):
-        x_path = torch.from_numpy(self.x[ret_a]).to(torch.float)
-        x_type = torch.from_numpy(ret_b).to(torch.long)
+        ret_a = torch.from_numpy(ret_a).to(torch.long)
+        x_path = (self.x[ret_a]).to(torch.float)
+
+        ret_b = torch.from_numpy(ret_b)
+        x_type = ret_b.to(torch.long)
         y = self.y[id].to(torch.long)
         return Batch(x_path=x_path, x_type=x_type, y=y)
-
-class MetaPathNet(LightningModule):
-    '''
-    Simple implementation of PathNet
-    '''
-
-    def __init__(self, feature_length, hidden_size, out_size, num_relations, dropout, **kwargs):
-        kwargs.setdefault('aggr', 'mean')
-        super(MetaPathNet, self).__init__()
-        self.save_hyperparameters()
-        self.num_relation = num_relations
-        self.feature_length, self.hidden_size, self.out_size \
-            = feature_length, hidden_size, out_size
-
-        self.fc0 = torch.nn.Linear(feature_length, hidden_size)
-
-        self.dropout = dropout
-        self.LSTM = torch.nn.LSTM(hidden_size, hidden_size)
-        self.fc2 = torch.nn.Linear(2 * hidden_size, out_size)
-        self.nets = torch.nn.ModuleList(
-            [torch.nn.Linear(hidden_size, hidden_size) for i in range(num_relations)])
-
-        self.attw = torch.nn.Linear(2 * hidden_size, 1)
-        self.Lrelu = torch.nn.LeakyReLU()
-
-        self.train_acc = Accuracy()
-        self.val_acc = Accuracy()
-        self.test_acc = Accuracy()
-
-    def forward(self, x_path, x_type):
-        batch_size, num_w, walk_len, _ = x_path.shape
-
-        x_path = self.fc0(x_path) # B, W, L, H
-        ego = x_path[:, 0, 0].clone()
-
-        x_path = x_path.reshape(batch_size * num_w, walk_len, self.hidden_size)
-        x_path = torch.flip(x_path, dims=[0]).reshape(batch_size * num_w * walk_len, self.hidden_size)
-
-
-        x_type = x_type.view(batch_size * num_w * walk_len)
-
-        nei_list = []
-        for layer in self.nets:
-            nei_l = layer(x_path)
-            nei_list.append(nei_l)
-        x_path = torch.stack(nei_list, dim=1)
-
-        indxx = torch.arange(batch_size * num_w * walk_len, dtype=torch.long)
-        x_path = x_path[indxx, x_type].view(
-            batch_size * num_w, walk_len, self.hidden_size).transpose(0, 1)
-        x_path = F.dropout(x_path, p=self.dropout, training=self.training)
-        x_path, (h_n, c_n) = self.LSTM(x_path)
-        h_n = h_n.transpose(0, 1).view(
-            num_w, batch_size, -1)  # [V, num_of_walks, H]
-
-        h_n = torch.mean(h_n, dim=0)
-        layer1 = torch.cat((ego, h_n), dim=1)  # [V, 2*H]
-        layer1 = F.dropout(layer1, p=self.dropout, training=self.training)
-        dout = self.fc2(layer1)
-        return dout
-
-    def training_step(self, batch, batch_idx: int):
-        y_hat = self(batch.x_path, batch.x_type)
-        train_loss = F.cross_entropy(y_hat, batch.y)
-        self.train_acc(y_hat.softmax(dim=-1), batch.y)
-        self.log('train_acc', self.train_acc, prog_bar=True, on_step=False,
-                 on_epoch=True)
-        return train_loss
-
-    def validation_step(self, batch, batch_idx: int):
-        y_hat = self(batch.x_path, batch.x_type)
-        self.val_acc(y_hat.softmax(dim=-1), batch.y)
-        self.log('val_acc', self.val_acc, on_step=False, on_epoch=True,
-                 prog_bar=True, sync_dist=True)
-
-    def test_step(self, batch, batch_idx: int):
-        y_hat = self(batch.x_path, batch.x_type)
-        self.test_acc(y_hat.softmax(dim=-1), batch.y)
-        self.log('test_acc', self.test_acc, on_step=False, on_epoch=True,
-                 prog_bar=True, sync_dist=True)
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
-        scheduler = StepLR(optimizer, step_size=25, gamma=0.25)
-        return [optimizer], [scheduler]
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--hidden_channels', type=int, default=1024)
-    parser.add_argument('--batch_size', type=int, default=1024)
-    parser.add_argument('--dropout', type=float, default=0.5)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--model', type=str, default='rgat',
-                        choices=['rgat', 'rgraphsage'])
-    parser.add_argument('--in-memory', action='store_true')
-    parser.add_argument('--device', type=str, default='0')
-    parser.add_argument('--evaluate', action='store_true')
-
-    args = parser.parse_args()
-    print(args)
-
-    seed_everything(42)
-    datamodule = MAG240M(ROOT, args.batch_size, args.in_memory)
-
-    if not args.evaluate:
-        model = MetaPathNet(datamodule.num_features,
-                     args.hidden_channels, datamodule.num_classes,
-                     datamodule.num_relations, dropout=args.dropout)
-        print(f'#Params {sum([p.numel() for p in model.parameters()])}')
-        checkpoint_callback = ModelCheckpoint(monitor='val_acc', mode='max',
-                                              save_top_k=1)
-        trainer = Trainer(gpus=[0], max_epochs=args.epochs,
-                          callbacks=[checkpoint_callback],
-                          default_root_dir=f'logs/{args.model}', accelerator='gpu', devices=2)
-        trainer.fit(model, datamodule=datamodule)
-
-    if args.evaluate:
-        dirs = glob.glob(f'logs/{args.model}/lightning_logs/*')
-        version = max([int(x.split(os.sep)[-1].split('_')[-1]) for x in dirs])
-        logdir = f'logs/{args.model}/lightning_logs/version_{version}'
-        print(f'Evaluating saved model in {logdir}...')
-        ckpt = glob.glob(f'{logdir}/checkpoints/*')[0]
-
-        trainer = Trainer(gpus=[0], resume_from_checkpoint=ckpt, accelerator='gpu', devices=2)
-        model = MetaPathNet.load_from_checkpoint(
-            checkpoint_path=ckpt, hparams_file=f'{logdir}/hparams.yaml')
-
-        datamodule.batch_size = 16
-        datamodule.sizes = [160] * len(args.sizes)  # (Almost) no sampling...
-
-        trainer.test(model=model, datamodule=datamodule)
-
-        evaluator = MAG240MEvaluator()
-        loader = datamodule.hidden_test_dataloader()
-
-        model.eval()
-        device = f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu'
-        model.to(device)
-        y_preds = []
-        for batch in tqdm(loader):
-            batch = batch.to(device)
-            with torch.no_grad():
-                out = model(batch.x, batch.adjs_t).argmax(dim=-1).cpu()
-                y_preds.append(out)
-        res = {'y_pred': torch.cat(y_preds, dim=0)}
-        evaluator.save_test_submission(res, f'results/{args.model}',
-                                       mode='test-dev')

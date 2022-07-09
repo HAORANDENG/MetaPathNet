@@ -11,11 +11,12 @@ typedef long long LL;
 
 class MetaPathSampler{
 private:
-    vector< vector<LL> > E;
-    vector< vector<LL> > edge_type;
-    LL num_node, num_edge, num_threads;
-    LL nw, wl;
-    LL *ret_path, *ret_dis;
+    vector< vector<int> > E;
+    vector< vector<char> edge_type;
+    int num_node, num_threads;
+    long long num_edge;
+    int nw, wl;
+    int *ret_path, *ret_dis;
 
 public:
     MetaPathSampler(np::ndarray edge_index_np, LL batch_size, LL num_walk, LL walk_len, LL num_workers);
@@ -59,15 +60,15 @@ MetaPathSampler::MetaPathSampler(np::ndarray edge_index_np, LL batch_size, LL nu
     E.resize(num_node);
     edge_type.resize(num_node);
     for (LL i=0;i<num_edge;i++) {
-        LL u = edge_index[i];
-        LL v = edge_index[num_edge+i];
-        LL t = edge_index[2*num_edge+i];
+        int u = (int)edge_index[i];
+        int v = (int)edge_index[num_edge+i];
+        char t = (char)edge_index[2*num_edge+i];
         E[u].push_back(v);
         edge_type[u].push_back(t);
     }
 
-    ret_path = new LL[batch_size*nw*wl];
-    ret_dis = new LL[batch_size*nw*wl];
+    ret_path = new int[batch_size*nw*wl];
+    ret_dis = new int[batch_size*nw*wl];
     num_threads = num_workers;
 
     cerr << "MetaPathSampler(#V: " << num_node << ", #E: " << num_edge << "). " << endl;
@@ -93,7 +94,7 @@ inline void MetaPathSampler::create_sample_thread(LL *batch, LL L, LL R) {
 }
 
 p::object MetaPathSampler::sample(np::ndarray batch_np) {
-    LL nd_batch_np = batch_np.get_nd();
+    int nd_batch_np = batch_np.get_nd();
     if (nd_batch_np != 1)
         throw std::runtime_error("\"edge_index\" must be 1-dimensional numpy.ndarray shapes like [num_node]. ");
     if (batch_np.get_dtype() != np::dtype::get_builtin<LL>())
@@ -111,9 +112,9 @@ p::object MetaPathSampler::sample(np::ndarray batch_np) {
     }
     for (LL i=0;i<(LL)thread_pool_.size();i++) thread_pool_[i].join();
 
-    np::dtype dt = np::dtype::get_builtin<LL>();
+    np::dtype dt = np::dtype::get_builtin<int>();
     p::tuple shape = p::make_tuple(batch_size, nw, wl);
-    p::tuple stride = p::make_tuple(sizeof(LL)*nw*wl, sizeof(LL)*wl, sizeof(LL));
+    p::tuple stride = p::make_tuple(sizeof(int)*nw*wl, sizeof(int)*wl, sizeof(int));
     p::object own;
     np::ndarray ret_path_np = np::from_data(ret_path, dt, shape, stride, own);
     np::ndarray ret_dis_np = np::from_data(ret_dis, dt, shape, stride, own);
