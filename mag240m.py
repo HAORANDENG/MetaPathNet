@@ -237,7 +237,6 @@ class MAG240M(LightningDataModule):
 
     def setup(self, stage: Optional[str] = None):
         t = time.perf_counter()
-        print('Reading dataset...', end=' ', flush=True)
         dataset = MAG240MDataset(self.data_dir)
 
         self.train_idx = torch.from_numpy(dataset.get_idx_split('train'))
@@ -248,16 +247,19 @@ class MAG240M(LightningDataModule):
         self.test_idx = torch.from_numpy(dataset.get_idx_split('test-dev'))
         self.test_idx.share_memory_()
 
+        print("Loading edge...", end=' ', flush=True)
         path = f'{dataset.dir}/edge_index.npy'
         edge_index = np.load(path)
         path_sampler.init()
         self.ps = path_sampler.MetaPathSampler(edge_index, 1024, 40, 3, 1)
         del edge_index
+        print(f"Done! [{time.perf_counter() - t:.2f}s]")
 
 
+        t = time.perf_counter()
+        print('Reading dataset...', end=' ', flush=True)
         self.x = np.load(f'{dataset.dir}/full_feat.npy')
         self.x = torch.from_numpy(self.x).share_memory_()
-
         self.y = torch.from_numpy(dataset.all_paper_label)
         print(f'Done! [{time.perf_counter() - t:.2f}s]')
 

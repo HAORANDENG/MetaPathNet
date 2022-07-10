@@ -12,7 +12,7 @@ typedef long long LL;
 class MetaPathSampler{
 private:
     vector< vector<int> > E;
-    vector< vector<char> > edge_type;
+    vector< vector<int> > edge_type;
     int num_node, num_threads;
     long long num_edge;
     int nw, wl;
@@ -60,9 +60,9 @@ MetaPathSampler::MetaPathSampler(np::ndarray edge_index_np, LL batch_size, LL nu
     E.resize(num_node);
     edge_type.resize(num_node);
     for (LL i=0;i<num_edge;i++) {
-        int u = (int)edge_index[i];
-        int v = (int)edge_index[num_edge+i];
-        char t = (char)edge_index[2*num_edge+i];
+        int u = edge_index[i];
+        int v = edge_index[num_edge+i];
+        int t = edge_index[2*num_edge+i];
         E[u].push_back(v);
         edge_type[u].push_back(t);
     }
