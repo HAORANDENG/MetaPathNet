@@ -12,7 +12,7 @@ typedef long long LL;
 class MetaPathSampler{
 private:
     vector< vector<int> > E;
-    vector< vector<char> edge_type;
+    vector< vector<char> > edge_type;
     int num_node, num_threads;
     long long num_edge;
     int nw, wl;
@@ -54,7 +54,7 @@ MetaPathSampler::MetaPathSampler(np::ndarray edge_index_np, LL batch_size, LL nu
         if (edge_index[i] < 0) {
             throw std::runtime_error("Negative node_id in \"edge_index\". ");
         }
-        num_node = max(num_node, edge_index[i]+1);
+        num_node = max(1LL * num_node, edge_index[i]+1);
     }
 
     E.resize(num_node);
